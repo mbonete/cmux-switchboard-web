@@ -296,6 +296,8 @@ function summarizeTranscript(lines) {
   const live = [...openTools.values()].filter((t) => (Date.parse(t.at) || 0) >= since);
   const lastTool = live[live.length - 1] || null;
   s.currentTool = lastTool ? describeTool(lastTool.name, lastTool.input) : null;
+  // Every open call, for pairing a permission request with the exact one it's about (pairTool).
+  s.openTools = live.map((t) => ({ name: t.name, input: t.input, at: t.at }));
   s.pendingQuestion = lastTool?.name === 'AskUserQuestion' ? normalizeQuestions(lastTool.input?.questions) : null;
   s.pendingPlan = lastTool?.name === 'ExitPlanMode' ? clip(String(lastTool.input?.plan || ''), 6000) : null;
   return s;
@@ -388,6 +390,26 @@ function parseLooseJSON(text) {
   }
 }
 
+/** How close (ms) a tool call must be to the permission request it's paired with. */
+const PAIR_WINDOW_MS = 30_000;
+
+/**
+ * The transcript's copy of the tool call a permission request is about (the
+ * Feed's copy has its paths redacted), only when it can't be another call:
+ * exactly one open call of that tool, made within 30 s of the request.
+ * Pairing by name alone could show one Bash command while Allow approved
+ * another (two running in parallel), or an older call still running while the
+ * new one hadn't reached the transcript yet. Otherwise null: the card shows the
+ * Feed's copy, which is exactly what Allow approves.
+ */
+function pairTool(openTools, toolName, requestedAt) {
+  const name = prettyToolName(toolName);
+  const at = Date.parse(requestedAt);
+  if (!name || !Number.isFinite(at)) return null;
+  const near = (openTools || []).filter((t) => prettyToolName(t.name) === name && Math.abs((Date.parse(t.at) || 0) - at) <= PAIR_WINDOW_MS);
+  return near.length === 1 ? describeTool(near[0].name, near[0].input) : null;
+}
+
 function describeDecision(feedItem, tx) {
   const kind = /question/i.test(feedItem.kind) ? 'question' : /plan/i.test(feedItem.kind) ? 'plan' : 'permission';
   const created = Date.parse(feedItem.created_at);
@@ -401,9 +423,9 @@ function describeDecision(feedItem, tx) {
     return { ...base, questions: tx?.pendingQuestion || [{ header: null, question: feedItem.question_prompt || feedItem.title || 'Question', multiSelect: Boolean(feedItem.question_multi_select), options: [] }] };
   }
   if (kind === 'plan') return { ...base, plan: tx?.pendingPlan || null };
-  // Prefer the transcript's copy of the tool call: the Feed copy has paths redacted.
+  // The transcript's copy of the exact call (the Feed copy has paths redacted), when it's certain.
   const toolName = feedItem.tool_name || feedItem.title;
-  const fromTx = tx?.currentTool && tx.currentTool.name === prettyToolName(toolName) ? tx.currentTool : null;
+  const fromTx = pairTool(tx?.openTools, toolName, feedItem.created_at);
   return { ...base, tool: fromTx || describeTool(toolName, parseLooseJSON(feedItem.tool_input) || {}) };
 }
 
@@ -736,9 +758,18 @@ const STATIC = {
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
+  // No other page may frame this one: a hidden frame under a fake button could steal a click on
+  // "Allow" (clickjacking). frame-ancestors for current browsers, X-Frame-Options for older ones.
+  'X-Frame-Options': 'DENY',
   'Content-Security-Policy':
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'",
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 };
+
+/** The token, compared in constant time. */
+function tokenOk(value) {
+  if (typeof value !== 'string' || value.length !== TOKEN.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(value), Buffer.from(TOKEN));
+}
 
 function send(res, status, type, body, extra = {}) {
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', ...SECURITY_HEADERS, ...extra });
@@ -782,7 +813,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/stream') {
-      if (url.searchParams.get('token') !== TOKEN) return send(res, 403, 'text/plain', 'Forbidden');
+      if (!tokenOk(url.searchParams.get('token'))) return send(res, 403, 'text/plain', 'Forbidden');
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive', ...SECURITY_HEADERS });
       res.write('retry: 2000\n\n');
       clients.add(res);
@@ -796,14 +827,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/snapshot' && req.method === 'GET') {
-      if (req.headers['x-switchboard-token'] !== TOKEN) return sendJSON(res, 403, { error: 'Forbidden' });
+      if (!tokenOk(req.headers['x-switchboard-token'])) return sendJSON(res, 403, { error: 'Forbidden' });
       return sendJSON(res, 200, snapshot ? currentPayload() : await buildSnapshot());
     }
 
     if (url.pathname === '/api/action' && req.method === 'POST') {
       const origin = req.headers.origin;
       if (origin && !ALLOWED_ORIGINS.has(origin)) return sendJSON(res, 403, { error: 'Forbidden origin' });
-      if (req.headers['x-switchboard-token'] !== TOKEN) return sendJSON(res, 403, { error: 'Forbidden' });
+      if (!tokenOk(req.headers['x-switchboard-token'])) return sendJSON(res, 403, { error: 'Forbidden' });
       if (!String(req.headers['content-type'] || '').startsWith('application/json')) return sendJSON(res, 415, { error: 'Send JSON' });
       const body = parseLooseJSON(await readBody(req));
       if (!body || typeof body !== 'object') return sendJSON(res, 400, { error: 'Invalid JSON' });
